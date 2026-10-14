@@ -58,7 +58,9 @@ enum class EnsembleType
   TI_AS,
   WALL_HARMONIC,
   TI_LIQUID,
-  TI_NEP
+  TI_NEP,
+  TI_NEP_GHOST,
+  TI_EQ_NEP_GHOST
 };
 
 inline bool is_standard_nvt(const EnsembleType type)
