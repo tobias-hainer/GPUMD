@@ -2,21 +2,22 @@
     Copyright 2017 Zheyong Fan and GPUMD development team
     This file is part of GPUMD.
     GPUMD is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
+    it under the terms of the GNU Lesser General Public License as published by
     the Free Software Foundation, either version 3 of the License, or
     (at your option) any later version.
     GPUMD is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-    You should have received a copy of the GNU General Public License
-    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
+    GNU Lesser General Public License for more details.
+    You should have received a copy of the GNU Lesser General Public License
+    along with GPUMD.  If not, see <https://www.gnu.org/licenses/>.
 */
 
 #include "ensemble_ti_nep_ghost.cuh"
 #include "utilities/compact_nep.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/run_input.cuh"
+#include <cstdio>
 #include <memory>
 
 namespace
@@ -160,7 +161,7 @@ static __global__ void initialize_properties_compact(
   }
 }
 
-// Beta smoothstep S_n(x) = I_x(n + 1, n + 1) for n = 4..8
+// Beta smoothstep S_n(x) = I_x(n + 1, n + 1) for n = 4..8 (n = 4 is the smootherstep)
 // S_n(x) = 1 - S_n(1 - x) is used for x > 1/2 to avoid round-off near x = 1
 static double smoothstep(const int order, double x)
 {
@@ -237,46 +238,72 @@ static double dsmoothstep(const int order, double x)
 
 } // namespace
 
+// ensemble ti_nep_ghost neq [keywords]
+// ensemble ti_nep_ghost eq <N_lambda> <equil_steps> <prod_steps> <forward|backward> [keywords]
+// for old inputs, "ti_nep_ghost [keywords]" is the neq mode and "ti_eq_nep_ghost ..." the eq mode
 Ensemble_TI_Nep_Ghost::Ensemble_TI_Nep_Ghost(const std::vector<std::string>& tokens)
 {
-  const int num_params = tokens.size();
   temperature_coupling = 100;
-  int i = 2;
+  if (tokens[1] == "ti_eq_nep_ghost") {
+    parse_eq(tokens, 2);
+  } else if (tokens.size() > 2 && tokens[2] == "neq") {
+    parse_neq(tokens, 3);
+  } else if (tokens.size() > 2 && tokens[2] == "eq") {
+    parse_eq(tokens, 3);
+  } else {
+    printf("No mode given for ensemble ti_nep_ghost, using the neq mode.\n");
+    parse_neq(tokens, 2);
+  }
+
+  type = EnsembleType::NVT_LAN;
+  c1 = exp(-0.5 / temperature_coupling);
+  c2 = sqrt((1 - c1 * c1) * K_B * temperature);
+}
+
+// keywords valid in both modes, returns false if tokens[i] is not one of them
+bool Ensemble_TI_Nep_Ghost::parse_common_keyword(const std::vector<std::string>& tokens, int i)
+{
+  if (tokens[i] == "temp") {
+    if (!is_valid_real(tokens[i + 1], &temperature))
+      PRINT_INPUT_ERROR("Wrong inputs for temp keyword.");
+  } else if (tokens[i] == "tperiod") {
+    if (!is_valid_real(tokens[i + 1], &temperature_coupling))
+      PRINT_INPUT_ERROR("Wrong inputs for t_period keyword.");
+  } else if (tokens[i] == "ghost_spring") {
+    if (!is_valid_real(tokens[i + 1], &ghost_k))
+      PRINT_INPUT_ERROR("Wrong inputs for ghost_spring keyword.");
+  } else if (tokens[i] == "path_order") {
+    if (!is_valid_int(tokens[i + 1], &path_order))
+      PRINT_INPUT_ERROR("Wrong inputs for path_order keyword.");
+    if (path_order < 4 || path_order > 8)
+      PRINT_INPUT_ERROR("path_order must be an integer between 4 and 8.");
+  } else {
+    return false;
+  }
+  return true;
+}
+
+void Ensemble_TI_Nep_Ghost::parse_neq(const std::vector<std::string>& tokens, int i)
+{
+  mode = Mode::NEQ;
+  const int num_params = tokens.size();
   while (i < num_params) {
     if (i + 1 >= num_params) {
       PRINT_INPUT_ERROR("Missing value for the last keyword of ensemble ti_nep_ghost.");
     }
-    if (tokens[i] == "tswitch") {
+    if (parse_common_keyword(tokens, i)) {
+    } else if (tokens[i] == "tswitch") {
       auto_switch = false;
       if (!is_valid_int(tokens[i + 1], &t_switch))
         PRINT_INPUT_ERROR("Wrong inputs for t_switch keyword.");
-      i += 2;
     } else if (tokens[i] == "tequil") {
       auto_switch = false;
       if (!is_valid_int(tokens[i + 1], &t_equil))
         PRINT_INPUT_ERROR("Wrong inputs for t_equil keyword.");
-      i += 2;
-    } else if (tokens[i] == "temp") {
-      if (!is_valid_real(tokens[i + 1], &temperature))
-        PRINT_INPUT_ERROR("Wrong inputs for temp keyword.");
-      i += 2;
-    } else if (tokens[i] == "tperiod") {
-      if (!is_valid_real(tokens[i + 1], &temperature_coupling))
-        PRINT_INPUT_ERROR("Wrong inputs for t_period keyword.");
-      i += 2;
-    } else if (tokens[i] == "ghost_spring") {
-      if (!is_valid_real(tokens[i + 1], &ghost_k))
-        PRINT_INPUT_ERROR("Wrong inputs for ghost_spring keyword.");
-      i += 2;
-    } else if (tokens[i] == "path_order") {
-      if (!is_valid_int(tokens[i + 1], &path_order))
-        PRINT_INPUT_ERROR("Wrong inputs for path_order keyword.");
-      if (path_order < 4 || path_order > 8)
-        PRINT_INPUT_ERROR("path_order must be an integer between 4 and 8.");
-      i += 2;
     } else {
-      PRINT_INPUT_ERROR("Unknown keyword.");
+      PRINT_INPUT_ERROR("Unknown keyword for the neq mode of ensemble ti_nep_ghost.");
     }
+    i += 2;
   }
   if ((t_switch < 0 && t_equil >= 0) || (t_switch >= 0 && t_equil < 0)) {
     PRINT_INPUT_ERROR(
@@ -288,20 +315,98 @@ Ensemble_TI_Nep_Ghost::Ensemble_TI_Nep_Ghost(const std::vector<std::string>& tok
     temperature,
     temperature_coupling);
   printf(
-    "Coupling is linear in lambda; path_order = %d is now the order of the time-switching "
-    "schedule lambda(t) (Beta smoothstep; 4 = smootherstep, equivalent to the former "
-    "path_order 0).\n",
+    "Nonequilibrium (neq) mode. Coupling is linear in lambda; path_order = %d is the order of "
+    "the time-switching schedule lambda(t) (Beta smoothstep; 4 = smootherstep).\n",
     path_order);
-  type = EnsembleType::NVT_LAN;
-  c1 = exp(-0.5 / temperature_coupling);
-  c2 = sqrt((1 - c1 * c1) * K_B * temperature);
 }
 
-void Ensemble_TI_Nep_Ghost::init(
-  const int number_of_steps,
-  const std::vector<Group>& group,
-  const Atom& atom,
-  const GPU_Vector<double>& thermo)
+void Ensemble_TI_Nep_Ghost::parse_eq(const std::vector<std::string>& tokens, int i)
+{
+  mode = Mode::EQ;
+  const int num_params = tokens.size();
+  if (num_params < i + 4) {
+    PRINT_INPUT_ERROR(
+      "The eq mode of ensemble ti_nep_ghost requires N_lambda, equil_steps, prod_steps, and "
+      "direction.");
+  }
+
+  if (!is_valid_int(tokens[i], &N_lambda)) {
+    PRINT_INPUT_ERROR("Wrong input for N_lambda.");
+  }
+  if (N_lambda < 2) {
+    PRINT_INPUT_ERROR("N_lambda should be >= 2.");
+  }
+
+  if (!is_valid_int(tokens[i + 1], &equil_steps)) {
+    PRINT_INPUT_ERROR("Wrong input for equil_steps.");
+  }
+  if (equil_steps < 0) {
+    PRINT_INPUT_ERROR("equil_steps should be >= 0.");
+  }
+
+  if (!is_valid_int(tokens[i + 2], &prod_steps)) {
+    PRINT_INPUT_ERROR("Wrong input for prod_steps.");
+  }
+  if (prod_steps <= 0) {
+    PRINT_INPUT_ERROR("prod_steps should be > 0.");
+  }
+
+  if (tokens[i + 3] == "forward") {
+    reverse_direction = false;
+  } else if (tokens[i + 3] == "backward") {
+    reverse_direction = true;
+  } else {
+    PRINT_INPUT_ERROR("direction should be 'forward' or 'backward'.");
+  }
+
+  i += 4;
+  while (i < num_params) {
+    if (i + 1 >= num_params) {
+      PRINT_INPUT_ERROR("Missing value for the last keyword of ensemble ti_nep_ghost.");
+    }
+    if (parse_common_keyword(tokens, i)) {
+    } else if (tokens[i] == "pre_equil") {
+      if (!is_valid_int(tokens[i + 1], &pre_equil_steps))
+        PRINT_INPUT_ERROR("Wrong inputs for pre_equil keyword.");
+      if (pre_equil_steps < 0)
+        PRINT_INPUT_ERROR("pre_equil should be >= 0.");
+    } else {
+      PRINT_INPUT_ERROR("Unknown keyword for the eq mode of ensemble ti_nep_ghost.");
+    }
+    i += 2;
+  }
+
+  steps_per_window = equil_steps + prod_steps;
+
+  printf(
+    "Thermostat: target temperature is %f k, t_period is %f timesteps.\n",
+    temperature,
+    temperature_coupling);
+  printf(
+    "Equilibrium (eq) mode: %d lambda windows, %d equilibration + %d production steps per "
+    "window, direction: %s.\n",
+    N_lambda,
+    equil_steps,
+    prod_steps,
+    reverse_direction ? "backward (lambda: 1 -> 0)" : "forward (lambda: 0 -> 1)");
+  printf(
+    "Coupling is linear in lambda; lambda windows placed at S_n(k / (N_lambda - 1)), Beta "
+    "smoothstep of order n = path_order = %d.\n",
+    path_order);
+  if (pre_equil_steps > 0) {
+    if (reverse_direction) {
+      printf(
+        "Pre-equilibration: %d steps ramping lambda 0 -> 1 (smootherstep) before the ladder "
+        "starts.\n",
+        pre_equil_steps);
+    } else {
+      printf(
+        "Pre-equilibration: %d steps at lambda = 0 before the ladder starts.\n", pre_equil_steps);
+    }
+  }
+}
+
+void Ensemble_TI_Nep_Ghost::init_neq(const int number_of_steps)
 {
   if (auto_switch) {
     t_switch = (int)(number_of_steps * 0.4);
@@ -313,7 +418,82 @@ void Ensemble_TI_Nep_Ghost::init(
     "timestep, t_equil is %d timesteps.\n",
     t_switch,
     t_equil);
+}
 
+void Ensemble_TI_Nep_Ghost::init_eq(const int number_of_steps)
+{
+  if (initialized) {
+    PRINT_INPUT_ERROR(
+      "ti_nep_ghost eq: init() called a second time on the same ensemble instance -- issue a "
+      "new 'ensemble ti_nep_ghost' line before each 'run' that should start a fresh ladder.");
+  }
+  initialized = true;
+
+  const int expected_total_steps = pre_equil_steps + N_lambda * steps_per_window;
+  if (number_of_steps != expected_total_steps) {
+    char message[256];
+    snprintf(
+      message,
+      sizeof(message),
+      "ti_nep_ghost eq requires run's step count to equal pre_equil_steps + N_lambda * "
+      "(equil_steps + prod_steps) = %d + %d * %d = %d, but run specified %d steps.",
+      pre_equil_steps,
+      N_lambda,
+      steps_per_window,
+      expected_total_steps,
+      number_of_steps);
+    PRINT_INPUT_ERROR(message);
+  }
+
+  // windows are uniform in u, with lambda = S_n(u)
+  u_grid.resize(N_lambda);
+  lambda_grid.resize(N_lambda);
+  for (int k = 0; k < N_lambda; ++k) {
+    u_grid[k] = (double)k / (double)(N_lambda - 1);
+    lambda_grid[k] = smoothstep(path_order, u_grid[k]);
+  }
+  lambda_grid[0] = 0.0;
+  lambda_grid[N_lambda - 1] = 1.0;
+  window_sum.assign(N_lambda, 0.0);
+  window_sumsq.assign(N_lambda, 0.0);
+  window_n.assign(N_lambda, 0);
+  window_mean.assign(N_lambda, 0.0);
+
+  // check that the lambda grid is strictly increasing
+  double dlambda_min = 1.0;
+  double dlambda_max = 0.0;
+  for (int k = 0; k < N_lambda - 1; ++k) {
+    const double d = lambda_grid[k + 1] - lambda_grid[k];
+    if (!(d > 0.0)) {
+      char message[256];
+      snprintf(
+        message,
+        sizeof(message),
+        "ti_nep_ghost eq: lambda grid is not strictly increasing between windows %d and %d "
+        "(lambda = %.17g, %.17g); reduce N_lambda or path_order = %d.",
+        k,
+        k + 1,
+        lambda_grid[k],
+        lambda_grid[k + 1],
+        path_order);
+      PRINT_INPUT_ERROR(message);
+    }
+    if (d < dlambda_min)
+      dlambda_min = d;
+    if (d > dlambda_max)
+      dlambda_max = d;
+  }
+  printf("Lambda windows (path_order = %d):\n", path_order);
+  printf("    %6s %14s %22s\n", "window", "u", "lambda");
+  for (int k = 0; k < N_lambda; ++k) {
+    printf("    %6d %14.10f %22.16e\n", k, u_grid[k], lambda_grid[k]);
+  }
+  printf("Smallest Delta lambda: %e; largest Delta lambda: %e.\n", dlambda_min, dlambda_max);
+}
+
+void Ensemble_TI_Nep_Ghost::init_ghost(
+  const std::vector<Group>& group, const Atom& atom, const GPU_Vector<double>& thermo)
+{
   const int N = atom.number_of_atoms;
   N_full = N;
 
@@ -334,9 +514,6 @@ void Ensemble_TI_Nep_Ghost::init(
     PRINT_INPUT_ERROR("ti_nep_ghost requires at least one atom in the ghost group.");
   }
   N_keep = N - ghost_size;
-
-  output_file = my_fopen("ti_nep_ghost.csv", "w");
-  fprintf(output_file, "lambda,dlambda,pe,pe_nep2,espring\n");
 
   curand_states.resize(N);
   int grid_size = (N - 1) / 128 + 1;
@@ -420,6 +597,35 @@ void Ensemble_TI_Nep_Ghost::init(
     ghost_k);
 }
 
+void Ensemble_TI_Nep_Ghost::initialize_before_first_step(
+  const double,
+  const int number_of_steps,
+  const std::vector<Group>& group,
+  Box&,
+  Atom& atom,
+  GPU_Vector<double>& thermo)
+{
+  if (mode == Mode::NEQ) {
+    init_neq(number_of_steps);
+  } else {
+    init_eq(number_of_steps);
+  }
+
+  init_ghost(group, atom, thermo);
+
+  if (mode == Mode::NEQ) {
+    output_file = my_fopen("ti_nep_ghost.csv", "w");
+    fprintf(output_file, "lambda,dlambda,pe,pe_nep2,espring\n");
+  } else {
+    dudl_file = my_fopen("ti_eq_nep_ghost_dudl.csv", "w");
+    fprintf(dudl_file, "global_step,window_index,u,lambda,dU_dlambda\n");
+    summary_file = my_fopen("ti_eq_nep_ghost_summary.csv", "w");
+    fprintf(
+      summary_file,
+      "window_index,u,lambda,mean_dU_dlambda,standard_error,n_samples,running_integral\n");
+  }
+}
+
 void Ensemble_TI_Nep_Ghost::find_thermo(
   const Box& box, const std::vector<Group>& group, const Atom& atom, GPU_Vector<double>& thermo)
 {
@@ -447,7 +653,7 @@ void Ensemble_TI_Nep_Ghost::find_thermo_nep2(const int number_of_atoms)
   pe_nep2 = sum;
 }
 
-Ensemble_TI_Nep_Ghost::~Ensemble_TI_Nep_Ghost(void) { close_output_file(false); }
+Ensemble_TI_Nep_Ghost::~Ensemble_TI_Nep_Ghost(void) { close_output_files(false); }
 
 void Ensemble_TI_Nep_Ghost::finalize_run(const Atom& atom, const Box&)
 {
@@ -462,33 +668,65 @@ void Ensemble_TI_Nep_Ghost::finalize_run(const Atom& atom, const Box&)
 
   double F_diff = E_diff - E_Ein;
 
-  FILE* yaml_file = my_fopen("ti_nep_ghost.yaml", "w");
+  FILE* yaml_file =
+    my_fopen(mode == Mode::NEQ ? "ti_nep_ghost.yaml" : "ti_eq_nep_ghost.yaml", "w");
+  fprintf(yaml_file, "mode: %s\n", mode == Mode::NEQ ? "neq" : "eq");
+  if (mode == Mode::EQ) {
+    fprintf(yaml_file, "direction: %s\n", reverse_direction ? "backward" : "forward");
+    fprintf(yaml_file, "N_lambda: %d\n", N_lambda);
+  }
   fprintf(yaml_file, "path_order: %d\n", path_order);
+  if (mode == Mode::EQ) {
+    fprintf(yaml_file, "windows_completed: %d\n", windows_completed);
+  }
   fprintf(yaml_file, "E_diff: %f\n", E_diff);
   fprintf(yaml_file, "E_Ein: %f\n", E_Ein);
   fprintf(yaml_file, "F_diff: %f\n", F_diff);
   fprintf(yaml_file, "T: %f\n", temperature);
 
-  close_output_file(true);
+  close_output_files(true);
   fclose(yaml_file);
 
   printf("\n");
   printf("-----------------------------------------------------------------------\n");
+  if (mode == Mode::EQ) {
+    printf("Equilibrium thermodynamic integration (ghost-atom / vacancy path)\n");
+    printf(
+      "Direction: %s\n",
+      reverse_direction ? "backward (lambda: 1 -> 0)" : "forward (lambda: 0 -> 1)");
+    if (windows_completed < N_lambda) {
+      printf(
+        "Warning: run ended after %d of %d windows; the integral below is partial (covers only "
+        "the completed lambda range).\n",
+        windows_completed,
+        N_lambda);
+    }
+  } else {
+    printf("Nonequilibrium thermodynamic integration (ghost-atom / vacancy path)\n");
+  }
   printf("TI integral (raw):                     %f eV\n", E_diff);
   printf("Einstein spring reference (E_Ein):     %f eV\n", E_Ein);
   printf("Difference in Helmholtz free energy:   %f eV\n", F_diff);
-  printf("These values are stored in ti_nep_ghost.yaml.\n");
+  if (mode == Mode::NEQ) {
+    printf("These values are stored in ti_nep_ghost.yaml.\n");
+  } else {
+    printf(
+      "These values are stored in ti_eq_nep_ghost.yaml; per-step and per-window data are in\n");
+    printf("ti_eq_nep_ghost_dudl.csv and ti_eq_nep_ghost_summary.csv.\n");
+  }
   printf("-----------------------------------------------------------------------\n");
 }
 
-void Ensemble_TI_Nep_Ghost::close_output_file(const bool print_message)
+void Ensemble_TI_Nep_Ghost::close_output_files(const bool print_message)
 {
-  if (output_file != nullptr) {
-    if (print_message) {
-      printf("Closing ti_nep_ghost output file...\n");
+  if (print_message) {
+    printf("Closing ti_nep_ghost output files...\n");
+  }
+  for (FILE** file : {&output_file, &dudl_file, &summary_file}) {
+    if (*file != nullptr) {
+      fclose(*file);
+      *file = nullptr;
     }
-    fclose(output_file);
-    output_file = nullptr;
   }
 }
 
@@ -526,17 +764,7 @@ double Ensemble_TI_Nep_Ghost::get_espring_sum(const int number_of_atoms)
   return temp;
 }
 
-void Ensemble_TI_Nep_Ghost::initialize_before_first_step(
-  const double,
-  const int number_of_steps,
-  const std::vector<Group>& group,
-  Box&,
-  Atom& atom,
-  GPU_Vector<double>& thermo)
-{
-  init(number_of_steps, group, atom, thermo);
-}
-
+// neq: lambda(t) for the step
 void Ensemble_TI_Nep_Ghost::find_lambda(const int step)
 {
   const int t = step - t_equil;
@@ -548,16 +776,17 @@ void Ensemble_TI_Nep_Ghost::find_lambda(const int step)
     dlambda = 0.0;
   } else if (t <= t_switch) {
     // forward switch 0 -> 1
-    lambda = switch_func(t * r_switch);
-    dlambda = dswitch_func(t * r_switch);
+    lambda = smoothstep(path_order, t * r_switch);
+    dlambda = dsmoothstep(path_order, t * r_switch) / t_switch;
   } else if (t < t_equil + t_switch) {
     // plateau at lambda = 1
     lambda = 1.0;
     dlambda = 0.0;
   } else if (t <= t_equil + 2 * t_switch) {
     // backward switch 1 -> 0
-    lambda = switch_func(1.0 - (t - t_switch - t_equil) * r_switch);
-    dlambda = -dswitch_func(1.0 - (t - t_switch - t_equil) * r_switch);
+    const double x = 1.0 - (t - t_switch - t_equil) * r_switch;
+    lambda = smoothstep(path_order, x);
+    dlambda = -dsmoothstep(path_order, x) / t_switch;
   } else {
     // after the backward leg, back at lambda = 0
     lambda = 0.0;
@@ -565,15 +794,121 @@ void Ensemble_TI_Nep_Ghost::find_lambda(const int step)
   }
 }
 
-void Ensemble_TI_Nep_Ghost::compute2(
-  const double time_step,
-  const int step,
-  const int number_of_steps,
-  const std::vector<Group>& group,
-  Box& box,
-  Atom& atoms,
-  GPU_Vector<double>& thermo,
-  Force& force)
+// neq: add the work of this step to the integral
+void Ensemble_TI_Nep_Ghost::accumulate_neq(const int number_of_atoms)
+{
+  if (dlambda == 0.0) {
+    return;
+  }
+  const int N = number_of_atoms;
+  espring = get_espring_sum(N);
+
+  // U = (1 - lambda) * U1 + lambda * U2, so dU/dlambda = U2 - U1
+  const double dudl = (pe_nep2 + espring) - pe;
+
+  fprintf(output_file, "%e,%e,%e,%e,%e\n", lambda, dlambda, pe / N, pe_nep2 / N, espring / N);
+
+  E_diff += 0.5 * dudl * fabs(dlambda);
+}
+
+// eq: window and lambda for the step
+void Ensemble_TI_Nep_Ghost::update_schedule(const int step)
+{
+  if (step < pre_equil_steps) {
+    // move to the starting lambda of the ladder
+    in_pre_equil = true;
+    window = reverse_direction ? (N_lambda - 1) : 0;
+    canonical_index = window;
+    step_in_window = -1;
+    if (reverse_direction) {
+      // ramp smoothly from lambda = 0 to 1 to avoid a sudden change of the forces
+      const double frac = (double)(step) / (double)pre_equil_steps;
+      lambda = smoothstep(4, frac);
+    } else {
+      lambda = 0.0;
+    }
+    in_production = false;
+    return;
+  }
+  in_pre_equil = false;
+  const int ladder_step = step - pre_equil_steps;
+  window = ladder_step / steps_per_window;
+  step_in_window = ladder_step % steps_per_window;
+  canonical_index = reverse_direction ? (N_lambda - 1 - window) : window;
+  lambda = lambda_grid[canonical_index];
+  in_production = step_in_window >= equil_steps;
+}
+
+// eq: sample dU/dlambda in the production part of a window
+void Ensemble_TI_Nep_Ghost::accumulate_eq(const int step, const int number_of_atoms)
+{
+  if (!in_production) {
+    return;
+  }
+  espring = get_espring_sum(number_of_atoms);
+
+  // U = (1 - lambda) * U1 + lambda * U2, so dU/dlambda = U2 - U1
+  const double dudl = (pe_nep2 + espring) - pe;
+
+  window_sum[canonical_index] += dudl;
+  window_sumsq[canonical_index] += dudl * dudl;
+  window_n[canonical_index] += 1;
+
+  fprintf(
+    dudl_file, "%d,%d,%e,%e,%e\n", step, canonical_index, u_grid[canonical_index], lambda, dudl);
+  fflush(dudl_file);
+
+  if (step_in_window == steps_per_window - 1) {
+    close_window();
+  }
+}
+
+void Ensemble_TI_Nep_Ghost::close_window()
+{
+  const int n = window_n[canonical_index];
+  const double mean = window_sum[canonical_index] / n;
+  double standard_error = 0.0;
+  if (n > 1) {
+    double variance = (window_sumsq[canonical_index] - n * mean * mean) / (n - 1);
+    if (variance < 0.0) {
+      variance = 0.0; // round-off
+    }
+    standard_error = sqrt(variance / n);
+  }
+  window_mean[canonical_index] = mean;
+  windows_completed += 1;
+
+  // trapezoidal rule over the completed windows
+  int lo, hi;
+  if (reverse_direction) {
+    lo = N_lambda - windows_completed;
+    hi = N_lambda - 1;
+  } else {
+    lo = 0;
+    hi = windows_completed - 1;
+  }
+  double running_integral = 0.0;
+  for (int k = lo; k < hi; ++k) {
+    running_integral +=
+      0.5 * (window_mean[k] + window_mean[k + 1]) * (lambda_grid[k + 1] - lambda_grid[k]);
+  }
+  E_diff = running_integral;
+
+  fprintf(
+    summary_file,
+    "%d,%e,%e,%e,%e,%d,%e\n",
+    canonical_index,
+    u_grid[canonical_index],
+    lambda_grid[canonical_index],
+    mean,
+    standard_error,
+    n,
+    running_integral);
+  fflush(summary_file);
+}
+
+// evaluate the NEP potential on the system without the ghost atoms
+void Ensemble_TI_Nep_Ghost::compute_ghost_free_system(Box& box, Atom& atoms)
 {
   const int N = atoms.number_of_atoms;
 
@@ -601,7 +936,6 @@ void Ensemble_TI_Nep_Ghost::compute2(
     virial_compact.data());
   GPU_CHECK_KERNEL
 
-  // evaluate the system without the ghost atoms
   nep_ghost->compute(
     box, type_compact, position_compact, potential_compact, force_compact, virial_compact);
 
@@ -617,30 +951,37 @@ void Ensemble_TI_Nep_Ghost::compute2(
     force_nep2.data() + N,
     force_nep2.data() + 2 * N);
   GPU_CHECK_KERNEL
+}
 
+void Ensemble_TI_Nep_Ghost::compute2(
+  const double time_step,
+  const int step,
+  const int number_of_steps,
+  const std::vector<Group>& group,
+  Box& box,
+  Atom& atoms,
+  GPU_Vector<double>& thermo,
+  Force& force)
+{
+  const int N = atoms.number_of_atoms;
+
+  compute_ghost_free_system(box, atoms);
+
+  if (mode == Mode::NEQ) {
+    find_lambda(step);
+  } else {
+    update_schedule(step);
+  }
   find_thermo(box, group, atoms, thermo);
   find_thermo_nep2(N);
-  find_lambda(step);
 
   add_mixed_force(box, atoms);
 
-  if (dlambda != 0.0) {
-    espring = get_espring_sum(N);
-
-    // U = (1 - lambda) * U1 + lambda * U2, so dU/dlambda = U2 - U1
-    const double dudl = (pe_nep2 + espring) - pe;
-
-    fprintf(output_file, "%e,%e,%e,%e,%e\n", lambda, dlambda, pe / N, pe_nep2 / N, espring / N);
-
-    E_diff += 0.5 * dudl * fabs(dlambda);
+  if (mode == Mode::NEQ) {
+    accumulate_neq(N);
+  } else {
+    accumulate_eq(step, N);
   }
 
   Ensemble_LAN::compute2(time_step, step, number_of_steps, group, box, atoms, thermo, force);
-}
-
-double Ensemble_TI_Nep_Ghost::switch_func(double t) { return smoothstep(path_order, t); }
-
-double Ensemble_TI_Nep_Ghost::dswitch_func(double t)
-{
-  return dsmoothstep(path_order, t) / t_switch;
 }
